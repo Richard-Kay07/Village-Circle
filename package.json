@@ -16,7 +16,9 @@
     "frontend:start": "cd frontend && npm run start",
     "frontend:dev": "cd frontend && npm run dev",
     "install:all": "npm run backend:install && npm run frontend:install",
-    "build:all": "npm run backend:prisma:generate && npm run backend:build && npm run frontend:build"
+    "build:all": "npm run backend:prisma:generate && npm run backend:build && npm run frontend:build",
+    "build": "npm run backend:install && npm run backend:prisma:generate && npm run backend:build",
+    "start": "cd backend && node dist/main"
   },
   "engines": {
     "node": ">=18"
