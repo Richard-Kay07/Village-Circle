@@ -1,0 +1,678 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity and RBAC: User (platform), tenant-scoped role on Member
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  email         String?
+  platformRole  String?  // PLATFORM_ADMIN when set
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  members Member[]
+  notificationsReceived Notification[]
+}
+
+enum GroupRole {
+  GROUP_CHAIR
+  GROUP_TREASURER
+  GROUP_SECRETARY
+  GROUP_AUDITOR
+  MEMBER
+}
+
+// ---------------------------------------------------------------------------
+// Core domain: Groups and members (UK savings/loan circles)
+// ---------------------------------------------------------------------------
+
+model Group {
+  id                String   @id @default(uuid())
+  name              String
+  currency          String   @default("GBP")
+  groupType         GroupType
+  loanInterestRate  Decimal  @db.Decimal(10, 4) @default(0) // configurable by group, e.g. 0.05 = 5%
+  status            GroupStatus @default(ACTIVE)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  members           Member[]
+  meetings          Meeting[]
+  contributions     Contribution[]
+  loans             Loan[]
+  loanApplications  LoanApplication[]
+  loanRepayments    LoanRepayment[]
+  loanWaiverEvents  LoanWaiverEvent[]
+  loanRescheduleEvents LoanRescheduleEvent[]
+  loanWriteOffEvents  LoanWriteOffEvent[]
+  socialFundBuckets SocialFundBucket[]
+  auditEvents       AuditEvent[]
+  evidenceFiles     EvidenceFile[]
+  roleAssignments   RoleAssignment[]
+  ledgerEvents      LedgerEvent[]
+  ledgerLines       LedgerLine[]
+  ruleVersions      RuleVersion[]
+  notifications     Notification[]
+  notificationTemplates NotificationTemplate[]
+}
+
+// ---------------------------------------------------------------------------
+// Group rule set: versioned loan/config rules with effective dating
+// ---------------------------------------------------------------------------
+
+enum LoanInterestBasis {
+  FLAT
+  SIMPLE_DECLINING
+}
+
+model RuleVersion {
+  id                     String   @id @default(uuid())
+  groupId                String
+  group                  Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  effectiveFrom          DateTime
+  effectiveTo            DateTime?
+  loanInterestEnabled    Boolean  @default(false)
+  loanInterestRateBps    Int      @default(0)   // basis points (100 bps = 1%); stored as integer
+  loanInterestBasis      LoanInterestBasis @default(FLAT)
+  penaltyEnabled         Boolean  @default(false)
+  penaltyRule            Json?    // placeholder: { rateBps?, graceDays?, ... } when implemented
+  socialFundEnabled      Boolean  @default(true)
+  smsNotificationsEnabled Boolean @default(false)
+  smsReceiptConfirmationEnabled Boolean @default(false) // tenant cost control for receipt SMS
+  createdAt              DateTime @default(now())
+  createdByUserId        String
+
+  @@index([groupId, effectiveFrom, effectiveTo])
+}
+
+enum GroupType {
+  CASH
+  BANK_TRANSFER
+}
+
+enum GroupStatus {
+  ACTIVE
+  CLOSED
+}
+
+model Member {
+  id          String    @id @default(uuid())
+  groupId     String
+  group       Group     @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  displayName String
+  phone       String?
+  role        MemberRole   @default(MEMBER)
+  groupRole   GroupRole?   // RBAC: when set overrides role for capability checks
+  status      MemberStatus @default(ACTIVE)
+  joinedAt    DateTime   @default(now())
+  leftAt      DateTime?
+  smsOptOut   Boolean    @default(false) // opt-out of non-critical SMS reminders
+
+  contributions     Contribution[]
+  loansAsBorrower   Loan[]
+  loanApplications  LoanApplication[]
+  loanRepayments    LoanRepayment[]
+  socialFundEntries SocialFundEntry[]
+  auditEvents       AuditEvent[]
+  ledgerLines       LedgerLine[]
+  notificationsReceived Notification[]
+}
+
+enum MemberRole {
+  ADMIN
+  MEMBER
+}
+
+enum MemberStatus {
+  ACTIVE
+  LEFT
+}
+
+// ---------------------------------------------------------------------------
+// Tenant-scoped role assignments (RBAC). One active per user/tenant/role.
+// ---------------------------------------------------------------------------
+
+model RoleAssignment {
+  id               String                 @id @default(uuid())
+  tenantGroupId    String
+  group            Group                  @relation(fields: [tenantGroupId], references: [id], onDelete: Restrict)
+  userId           String
+  role             GroupRole
+  status           RoleAssignmentStatus   @default(ACTIVE)
+  createdAt        DateTime               @default(now())
+  createdByUserId  String
+  revokedAt        DateTime?
+  revokedByUserId  String?
+
+  @@index([tenantGroupId, userId, role, status])
+  @@index([tenantGroupId, status])
+  @@index([userId, tenantGroupId])
+}
+
+enum RoleAssignmentStatus {
+  ACTIVE
+  REVOKED
+}
+
+// ---------------------------------------------------------------------------
+// Meetings (for bulk contribution entry and mixed-mode recording)
+// ---------------------------------------------------------------------------
+
+model Meeting {
+  id           String   @id @default(uuid())
+  groupId      String
+  group        Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  heldAt       DateTime
+  name         String?  // optional label e.g. "March 2025"
+  createdAt    DateTime @default(now())
+
+  contributions Contribution[]
+
+  @@index([groupId, heldAt])
+}
+
+// ---------------------------------------------------------------------------
+// Append-only financial events (no destructive edits; corrections = reversals)
+// ---------------------------------------------------------------------------
+
+model Contribution {
+  id                     String               @id @default(uuid())
+  groupId                String
+  group                  Group                 @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  memberId               String
+  member                 Member                @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  meetingId              String?
+  meeting                Meeting?              @relation(fields: [meetingId], references: [id], onDelete: SetNull)
+  transactionMode        String?              // CASH | BANK_TRANSFER (required for new MVP records)
+  savingsAmountMinor      Int?                 // >= 0
+  socialFundAmountMinor   Int?                 // >= 0
+  totalAmountMinor       Int?                 // savings + socialFund
+  externalReferenceText  String?              // text evidence ref (allowed for both modes)
+  evidenceFileId         String?              // image evidence (API: evidenceAttachmentId)
+  evidenceFile           EvidenceFile?        @relation(fields: [evidenceFileId], references: [id])
+  status                 ContributionStatus   @default(RECORDED)
+  recordedByUserId       String?
+  recordedAt             DateTime?
+  reversedByUserId       String?
+  reversedAt             DateTime?
+  reversalReason         String?
+  ledgerEventId          String?              // link to LedgerEvent for this contribution
+  idempotencyKey         String?              @unique // required for API record; optional for reversals
+  // Legacy fields (kept for backward compat)
+  amount                 Decimal?             @db.Decimal(14, 2)
+  type                   ContributionType     @default(CONTRIBUTION)
+  evidenceType           EvidenceType?
+  evidenceReference      String?
+  createdAt              DateTime             @default(now())
+  createdByMemberId      String?
+  auditEventId           String?
+  auditEvent             AuditEvent?          @relation(fields: [auditEventId], references: [id])
+
+  @@index([groupId, createdAt])
+  @@index([groupId, idempotencyKey])
+  @@index([groupId, meetingId])
+  @@index([meetingId])
+}
+
+enum ContributionStatus {
+  RECORDED
+  REVERSED
+}
+
+enum ContributionType {
+  CONTRIBUTION
+  REVERSAL
+  ADJUSTMENT
+}
+
+// ---------------------------------------------------------------------------
+// Loan application and loan lifecycle
+// ---------------------------------------------------------------------------
+
+enum LoanApplicationStatus {
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+model LoanApplication {
+  id                   String   @id @default(uuid())
+  groupId              String
+  group                Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  memberId             String
+  member               Member   @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  requestedAmountMinor  Int
+  requestedTermPeriods  Int
+  purpose              String?
+  status               LoanApplicationStatus @default(SUBMITTED)
+  submittedByUserId    String
+  submittedAt          DateTime @default(now())
+
+  loan Loan?
+
+  @@index([groupId, status])
+  @@index([memberId])
+}
+
+enum LoanState {
+  APPROVED
+  DISBURSEMENT_RECORDED
+  ACTIVE
+  COMPLETED
+  RESCHEDULED
+  WRITTEN_OFF
+}
+
+model Loan {
+  id                       String     @id @default(uuid())
+  groupId                  String
+  group                    Group      @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  borrowerId               String
+  borrower                 Member     @relation(fields: [borrowerId], references: [id], onDelete: Restrict)
+  applicationId            String?    @unique
+  application              LoanApplication? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  principalAmountMinor     Int
+  currencyCode             String     @default("GBP")
+  interestEnabledSnapshot  Boolean    @default(false)
+  interestRateBpsSnapshot  Int        @default(0)
+  interestBasisSnapshot    String     @default("FLAT")
+  ruleVersionIdSnapshot    String?
+  termPeriods              Int
+  approvedByUserId         String
+  approvedAt               DateTime
+  disbursementRecordedAt   DateTime?
+  state                    LoanState  @default(APPROVED)
+  createdAt                DateTime   @default(now())
+  updatedAt                DateTime   @updatedAt
+  // Legacy (kept for compatibility)
+  principalAmount          Decimal?   @db.Decimal(14, 2)
+  interestRate             Decimal?   @db.Decimal(10, 4)
+  disbursedAt              DateTime?
+  dueAt                    DateTime?
+
+  scheduleItems LoanScheduleItem[]
+  repayments    LoanRepayment[]
+  waiverEvents    LoanWaiverEvent[]
+  rescheduleEvents LoanRescheduleEvent[]
+  writeOffEvents   LoanWriteOffEvent[]
+}
+
+enum LoanScheduleItemStatus {
+  DUE
+  PART_PAID
+  PAID
+  OVERDUE
+  WAIVED
+}
+
+model LoanScheduleItem {
+  id                String   @id @default(uuid())
+  loanId            String
+  loan              Loan     @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  installmentNo     Int
+  dueDate           DateTime
+  principalDueMinor  Int
+  interestDueMinor   Int      @default(0)
+  penaltyDueMinor   Int      @default(0)
+  totalDueMinor     Int
+  paidPrincipalMinor Int     @default(0)
+  paidInterestMinor  Int     @default(0)
+  paidPenaltyMinor   Int     @default(0)
+  status            LoanScheduleItemStatus @default(DUE)
+  supersededByRescheduleEventId String?
+  supersededByRescheduleEvent  LoanRescheduleEvent? @relation(fields: [supersededByRescheduleEventId], references: [id], onDelete: SetNull)
+  createdAt         DateTime @default(now())
+
+  @@unique([loanId, installmentNo])
+  @@index([loanId])
+  @@index([supersededByRescheduleEventId])
+}
+
+model LoanRepayment {
+  id                     String           @id @default(uuid())
+  loanId                 String
+  loan                   Loan             @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  groupId                String
+  group                  Group            @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  transactionMode        String           // CASH | BANK_TRANSFER
+  amountMinor            Int
+  principalMinor         Int              // allocation: principal portion
+  interestMinor          Int              @default(0)
+  penaltyMinor           Int              @default(0)
+  externalReferenceText  String?
+  evidenceFileId         String?
+  evidenceFile           EvidenceFile?    @relation(fields: [evidenceFileId], references: [id])
+  recordedByUserId       String
+  recordedAt             DateTime         @default(now())
+  idempotencyKey         String?          @unique
+  ledgerEventId          String?
+  createdAt              DateTime         @default(now())
+  // Legacy
+  amount                 Decimal?         @db.Decimal(14, 2)
+  type                   LoanRepaymentType @default(REPAYMENT)
+  evidenceType           EvidenceType?
+  evidenceReference      String?
+  createdByMemberId      String?
+  auditEventId           String?
+  auditEvent             AuditEvent?      @relation(fields: [auditEventId], references: [id])
+
+  @@index([loanId, createdAt])
+  @@index([loanId, idempotencyKey])
+}
+
+enum LoanRepaymentType {
+  REPAYMENT
+  REVERSAL
+  ADJUSTMENT
+}
+
+// ---------------------------------------------------------------------------
+// Loan exception events (explicit records; reason + approver required)
+// ---------------------------------------------------------------------------
+
+model LoanWaiverEvent {
+  id               String   @id @default(uuid())
+  loanId           String
+  loan             Loan     @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  groupId          String
+  group            Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  reason           String
+  approvedByUserId  String
+  approvedAt        DateTime @default(now())
+  scheduleItemId   String?  // optional: which installment was waived (e.g. penalty for one installment)
+  amountMinorWaived Int     @default(0)  // total waived in this event (penalty + interest as applicable)
+  waiverType       String?  // PENALTY | INTEREST | BOTH (MVP: optional)
+  metadata         Json?
+  createdAt        DateTime @default(now())
+
+  @@index([loanId])
+  @@index([groupId])
+}
+
+model LoanRescheduleEvent {
+  id                  String   @id @default(uuid())
+  loanId              String
+  loan                Loan     @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  groupId             String
+  group               Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  reason              String
+  approvedByUserId    String
+  approvedAt          DateTime @default(now())
+  previousTermPeriods Int?    // term periods before reschedule
+  newTermPeriods      Int?    // term periods after (placeholder; full pricing deferred)
+  firstDueDate        DateTime? // first due date of new schedule (placeholder)
+  metadata            Json?
+  createdAt           DateTime @default(now())
+
+  supersededScheduleItems LoanScheduleItem[]
+
+  @@index([loanId])
+  @@index([groupId])
+}
+
+model LoanWriteOffEvent {
+  id               String   @id @default(uuid())
+  loanId           String
+  loan             Loan     @relation(fields: [loanId], references: [id], onDelete: Restrict)
+  groupId          String
+  group            Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  reason           String
+  approvedByUserId String
+  approvedAt       DateTime @default(now())
+  amountMinorWrittenOff Int?  // null in skeleton until full implementation
+  metadata         Json?
+  createdAt        DateTime @default(now())
+
+  @@index([loanId])
+  @@index([groupId])
+}
+
+// ---------------------------------------------------------------------------
+// Social fund: separate ledger buckets per group
+// ---------------------------------------------------------------------------
+
+model SocialFundBucket {
+  id        String   @id @default(uuid())
+  groupId   String
+  group     Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  name      String   // e.g. "Welfare", "Emergency"
+  createdAt DateTime @default(now())
+
+  entries SocialFundEntry[]
+}
+
+model SocialFundEntry {
+  id               String              @id @default(uuid())
+  bucketId         String
+  bucket           SocialFundBucket    @relation(fields: [bucketId], references: [id], onDelete: Restrict)
+  amount           Decimal             @db.Decimal(14, 2) // + = contribution, - = disbursement
+  type             SocialFundEntryType @default(CONTRIBUTION)
+  idempotencyKey   String?
+  evidenceType     EvidenceType?
+  evidenceReference String?
+  evidenceFileId   String?
+  createdAt        DateTime            @default(now())
+  createdByMemberId String
+  auditEventId     String?
+  auditEvent       AuditEvent?         @relation(fields: [auditEventId], references: [id])
+
+  @@unique([bucketId, idempotencyKey])
+  @@index([bucketId, createdAt])
+}
+
+enum SocialFundEntryType {
+  CONTRIBUTION
+  DISBURSEMENT
+  REVERSAL
+  ADJUSTMENT
+}
+
+// ---------------------------------------------------------------------------
+// Evidence (text reference or image upload)
+// ---------------------------------------------------------------------------
+
+model EvidenceFile {
+  id         String   @id @default(uuid())
+  groupId    String
+  group      Group    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  storedPath String   // path or key in storage (e.g. S3 key)
+  mimeType   String
+  sizeBytes  Int
+  uploadedBy String
+  createdAt  DateTime @default(now())
+
+  contributions   Contribution[]
+  loanRepayments  LoanRepayment[]
+}
+
+enum EvidenceType {
+  TEXT_REFERENCE
+  IMAGE_UPLOAD
+}
+
+// ---------------------------------------------------------------------------
+// Notifications: entity, template (MVP simple), delivery status, retry hooks
+// ---------------------------------------------------------------------------
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+model NotificationTemplate {
+  id           String   @id @default(uuid())
+  groupId      String?  // null = global template
+  group        Group?   @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  templateKey  String
+  channel      NotificationChannel
+  subject      String?  // for EMAIL
+  bodyTemplate String   // simple {{variable}} interpolation
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([groupId, templateKey, channel])
+  @@index([templateKey, channel])
+}
+
+model Notification {
+  id                  String   @id @default(uuid())
+  tenantGroupId       String
+  group               Group    @relation(fields: [tenantGroupId], references: [id], onDelete: Restrict)
+  recipientUserId     String?
+  recipientUser       User?    @relation(fields: [recipientUserId], references: [id], onDelete: SetNull)
+  recipientMemberId   String?
+  recipientMember     Member?  @relation(fields: [recipientMemberId], references: [id], onDelete: SetNull)
+  channel             NotificationChannel
+  templateKey         String
+  payload             Json?    // template variables
+  status              NotificationStatus @default(QUEUED)
+  providerMessageId   String?
+  errorCode           String?
+  errorMessage        String?
+  retryCount          Int      @default(0)
+  createdAt           DateTime @default(now())
+  sentAt              DateTime?
+  deliveredAt         DateTime?
+  readAt              DateTime? // for IN_APP when user marks read
+  mandatory           Boolean  @default(false) // when true, skip user preference check
+
+  @@index([tenantGroupId, status])
+  @@index([recipientUserId, createdAt])
+  @@index([recipientMemberId, createdAt])
+  @@index([status, retryCount])
+}
+
+// ---------------------------------------------------------------------------
+// Audit: immutable log (append-only). sequenceNo is monotonic per tenant.
+// Legacy AuditEvent kept for Contribution/LoanRepayment/SocialFundEntry FKs.
+// ---------------------------------------------------------------------------
+
+model AuditSequence {
+  id             String   @id @default(uuid())
+  tenantGroupId  String?  // null = global sequence
+  nextValue      Int      @default(1)
+
+  @@unique([tenantGroupId])
+}
+
+model AuditLog {
+  id                    String    @id @default(uuid())
+  tenantGroupId         String?
+  actorUserId           String?
+  actingOnBehalfOfUserId String?
+  channel               String    // WEB, MOBILE_APP, ADMIN_PORTAL, SYSTEM, SMS_WEBHOOK
+  action                String
+  entityType            String
+  entityId              String
+  beforeSnapshot        Json?
+  afterSnapshot         Json?
+  metadata              Json?
+  reasonCode            String?   // required for admin/support access events
+  sequenceNo             Int
+  createdAt             DateTime  @default(now())
+
+  @@index([tenantGroupId, sequenceNo])
+  @@index([tenantGroupId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Legacy audit (FKs from Contribution, LoanRepayment, SocialFundEntry)
+// ---------------------------------------------------------------------------
+
+model AuditEvent {
+  id         String     @id @default(uuid())
+  groupId    String
+  group      Group      @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  entityType AuditEntityType
+  entityId   String
+  action     String     // CREATED, UPDATED, REVERSED, ADJUSTMENT, etc.
+  actorId    String     // memberId or "system"
+  payload    Json?
+  createdAt  DateTime   @default(now())
+
+  contribution    Contribution?
+  loanRepayment   LoanRepayment?
+  socialFundEntry SocialFundEntry?
+}
+
+enum AuditEntityType {
+  GROUP
+  MEMBER
+  CONTRIBUTION
+  LOAN
+  LOAN_REPAYMENT
+  SOCIAL_FUND_BUCKET
+  SOCIAL_FUND_ENTRY
+}
+
+// ---------------------------------------------------------------------------
+// Ledger: append-only, event-linked. amountMinor = signed (credit +, debit -).
+// ---------------------------------------------------------------------------
+
+enum LedgerFundBucket {
+  SAVINGS
+  SOCIAL_FUND
+  LOAN_PRINCIPAL
+  LOAN_INTEREST
+  PENALTY
+  WAIVER_ADJUSTMENT
+}
+
+model LedgerEvent {
+  id                      String       @id @default(uuid())
+  tenantGroupId           String
+  group                   Group        @relation(fields: [tenantGroupId], references: [id], onDelete: Restrict)
+  sourceEventType         String
+  sourceEventId           String
+  transactionMode         String?
+  eventTimestamp          DateTime
+  recordedByUserId        String
+  idempotencyKey          String?      @unique
+  reversalOfLedgerEventId String?
+  reversalOfLedgerEvent   LedgerEvent? @relation("LedgerReversal", fields: [reversalOfLedgerEventId], references: [id])
+  reversalLedgerEvents    LedgerEvent[] @relation("LedgerReversal")
+  metadata                Json?
+  createdAt               DateTime     @default(now())
+
+  lines LedgerLine[]
+
+  @@index([tenantGroupId, eventTimestamp])
+  @@index([tenantGroupId, sourceEventType, sourceEventId])
+}
+
+model LedgerLine {
+  id                     String           @id @default(uuid())
+  ledgerEventId          String
+  ledgerEvent            LedgerEvent     @relation(fields: [ledgerEventId], references: [id], onDelete: Restrict)
+  tenantGroupId          String
+  group                  Group           @relation(fields: [tenantGroupId], references: [id], onDelete: Restrict)
+  memberId               String?
+  member                 Member?         @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  fundBucket             LedgerFundBucket
+  amountMinor            Int
+  currencyCode           String          @default("GBP")
+  runningBalanceSnapshot Int?
+  createdAt              DateTime        @default(now())
+
+  @@index([tenantGroupId, memberId, fundBucket])
+  @@index([ledgerEventId])
+}

@@ -1,0 +1,24 @@
+{
+  "name": "village-circle-360",
+  "private": true,
+  "description": "UK group savings and loan circle management platform - MVP",
+  "scripts": {
+    "backend:install": "cd backend && npm install",
+    "backend:build": "cd backend && npm run build",
+    "backend:start": "cd backend && npm run start",
+    "backend:start:dev": "cd backend && npm run start:dev",
+    "backend:test": "cd backend && npm run test",
+    "backend:test:cov": "cd backend && npm run test:cov",
+    "backend:prisma:generate": "cd backend && npx prisma generate",
+    "backend:prisma:migrate": "cd backend && npx prisma migrate dev",
+    "frontend:install": "cd frontend && npm install",
+    "frontend:build": "cd frontend && npm run build",
+    "frontend:start": "cd frontend && npm run start",
+    "frontend:dev": "cd frontend && npm run dev",
+    "install:all": "npm run backend:install && npm run frontend:install",
+    "build:all": "npm run backend:prisma:generate && npm run backend:build && npm run frontend:build"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
